@@ -8,6 +8,9 @@ import sys
 import importlib.util
 from enum import IntEnum
 from pathlib import Path
+
+# Windows embeddable Python may omit the script directory from sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pkgutil
 from typing import List, Optional
 
