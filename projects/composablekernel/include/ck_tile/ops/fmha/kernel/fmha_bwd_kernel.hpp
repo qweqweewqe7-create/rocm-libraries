@@ -441,7 +441,8 @@ struct FmhaBwdWorkspaceManager
 template <typename FmhaPipeline_,
           typename KGradEpiloguePipeline_,
           typename VGradEpiloguePipeline_,
-          typename QGradEpiloguePipeline_ = void>
+          typename QGradEpiloguePipeline_ = void,
+          bool SkipDqWorkspace_           = false>
 struct FmhaBwdDQDKDVKernel
 {
     using FmhaPipeline                            = ck_tile::remove_cvref_t<FmhaPipeline_>;
@@ -454,6 +455,10 @@ struct FmhaBwdDQDKDVKernel
         ck_tile::fmha_bwd_qr_qtr_dor_pipeline<FmhaPipeline>::value;
     static constexpr bool kUseQMajorDQ = ck_tile::fmha_bwd_qmajor_dq_pipeline<FmhaPipeline>::value;
     static constexpr bool kWritesDqDirect = kUseQrQtrDorPipeline || kUseQMajorDQ;
+    // Product-dual DKDV does not accumulate dQ. Keep its kargs layout unchanged,
+    // but omit the legacy dQ workspace and its host-to-device staging.
+    static constexpr bool kSkipDqWorkspace = SkipDqWorkspace_;
+    static constexpr bool kNoDqWorkspace   = kWritesDqDirect || kSkipDqWorkspace;
     static_assert(!kUseQrQtrDorPipeline || !std::is_same_v<QGradEpiloguePipeline_, void>,
                   "QrQtrDorPipeline needs QGradEpiloguePipeline");
 
@@ -494,6 +499,8 @@ struct FmhaBwdDQDKDVKernel
 #endif
     static constexpr bool kUsePersistent =
         kIsDeterministic && !kUseQrQtrDorPipeline && !kUseQMajorDQ;
+    static_assert(!kSkipDqWorkspace || (!kIsGroupMode && !kIsDeterministic),
+                  "DKDV workspace omission is restricted to non-deterministic batch mode");
     using WorkspaceManager = FmhaBwdWorkspaceManager<AccDataType, kIsGroupMode, kIsDeterministic>;
 
     // clang-format off
@@ -543,13 +550,13 @@ struct FmhaBwdDQDKDVKernel
     template <typename... Args>
     CK_TILE_HOST static constexpr auto GetWorkspaceHostSize(Args&&... args)
     {
-        return WorkspaceManager::template GetWorkspaceHostSize<kWritesDqDirect>(
+        return WorkspaceManager::template GetWorkspaceHostSize<kNoDqWorkspace>(
             std::forward<Args>(args)...);
     }
     template <typename... Args>
     CK_TILE_HOST static constexpr auto PrepareWorkspaceHost(Args&&... args)
     {
-        return WorkspaceManager::template PrepareWorkspaceHost<kWritesDqDirect,
+        return WorkspaceManager::template PrepareWorkspaceHost<kNoDqWorkspace,
                                                                FmhaPipeline::BlockFmhaShape::kN0,
                                                                FmhaPipeline::BlockFmhaShape::kM0>(
             std::forward<Args>(args)...);
@@ -558,11 +565,13 @@ struct FmhaBwdDQDKDVKernel
     CK_TILE_HOST static size_t GetWorkspaceDeviceSizeUpperBound(Args&&... args)
     {
         return WorkspaceManager::template GetWorkspaceDeviceSizeUpperBound<
-            kWritesDqDirect,
+            kNoDqWorkspace,
             FmhaPipeline::BlockFmhaShape::kN0>(std::forward<Args>(args)...);
     }
     CK_TILE_HOST static constexpr bool NeedsZeroDqAcc()
     {
+        if constexpr(kSkipDqWorkspace)
+            return false;
         return WorkspaceManager::template NeedsZeroDqAcc<kWritesDqDirect, kHasMask>();
     }
     // Group + persistent + deterministic is the only path where NeedsZeroDqAcc()
@@ -919,6 +928,8 @@ struct FmhaBwdDQDKDVKernel
              [&]() {
                  if constexpr(kWritesDqDirect)
                      return dq_ptr;
+                 else if constexpr(kSkipDqWorkspace)
+                     return static_cast<void*>(nullptr);
                  else
                      return ws +
                             WorkspaceManager::template GetDqAccDataOffset<kUseQrQtrDorPipeline>(
@@ -1098,6 +1109,8 @@ struct FmhaBwdDQDKDVKernel
              [&]() {
                  if constexpr(kWritesDqDirect)
                      return dq_ptr;
+                 else if constexpr(kSkipDqWorkspace)
+                     return static_cast<void*>(nullptr);
                  else
                      return ws +
                             WorkspaceManager::template GetDqAccDataOffset<kUseQrQtrDorPipeline>(
